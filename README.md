@@ -39,6 +39,14 @@ mnemonai
 mnemonai --local
 ```
 
+## Dashboard
+
+The list view defaults to a hierarchical dashboard grouped by project path, with a live preview pane on the right showing the selected conversation's metadata (project, branch, session, model, tokens) and rendered body. The pane auto-collapses on terminals narrower than 100 columns.
+
+Status glyphs reflect recency: `●` active (≤ 10 min), `◐` recent (≤ 2 h), `○` idle, `✗` parse errors or deleted project.
+
+Toggle to the original flat list with `G`. Hide the preview pane with `P`.
+
 ## Keyboard Shortcuts
 
 Press `?` at any time to open the help overlay.
@@ -53,7 +61,16 @@ Press `?` at any time to open the help overlay.
 | `Page Up/Down` | Page navigation |
 | `Ctrl+D/U` | Half page down/up |
 | `Ctrl+N/P` | Next/prev (emacs-style) |
-| `Enter` | View conversation |
+| `Enter` | View conversation (or expand/collapse group) |
+| `Tab` | Expand/collapse selected group |
+| `Shift+Tab` | Collapse all groups |
+| `*` | Expand all groups |
+| `1`–`9` | Jump to Nth group |
+| `G` | Toggle grouped/flat view |
+| `P` | Toggle preview pane |
+| `→` | Focus preview pane |
+| `←` / `h` / `Esc` | Return focus to list |
+| `j` / `k` | Scroll preview (when focused) |
 | `Ctrl+R` | Resume conversation in original tool |
 | `Ctrl+X` | Delete conversation |
 | `Ctrl+O` | Select and exit |
