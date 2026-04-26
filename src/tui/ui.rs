@@ -1,6 +1,7 @@
 use crate::history::ProviderKind;
 use crate::tui::app::{
-    App, AppMode, DialogMode, LineStyle, LoadingState, RenderedLine, ViewSearchMode, ViewState,
+    App, AppMode, DialogMode, LineStyle, ListViewMode, LoadingState, PaneFocus, RenderedLine, Row,
+    ViewSearchMode, ViewState,
 };
 use crate::tui::search::is_word_separator;
 use chrono::{DateTime, Local};
@@ -136,7 +137,11 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
             .constraints([Constraint::Length(2), Constraint::Min(1)])
             .split(inner_area);
         render_search_bar(frame, app, chunks[0]);
-        render_list(frame, app, chunks[1]);
+        if app.view_mode() == ListViewMode::Grouped {
+            render_grouped_list(frame, app, chunks[1]);
+        } else {
+            render_list(frame, app, chunks[1]);
+        }
         return;
     }
 
@@ -151,7 +156,23 @@ fn render_list_mode(frame: &mut Frame, app: &App) {
         .split(inner_area);
 
     render_search_bar(frame, app, chunks[0]);
-    render_list(frame, app, chunks[1]);
+
+    let body_area = chunks[1];
+    let show_preview =
+        app.view_mode() == ListViewMode::Grouped && app.preview_visible() && body_area.width >= 100;
+
+    if show_preview {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(body_area);
+        render_grouped_list(frame, app, split[0]);
+        render_preview_pane(frame, app, split[1]);
+    } else if app.view_mode() == ListViewMode::Grouped {
+        render_grouped_list(frame, app, body_area);
+    } else {
+        render_list(frame, app, body_area);
+    }
 
     // Render bottom bar: confirm dialog > status message > hotkeys
     if *app.dialog_mode() == DialogMode::ConfirmDelete {
@@ -194,14 +215,30 @@ fn render_list_status_bar(frame: &mut Frame, app: &App, area: Rect) {
         (key_style, label_style)
     };
 
+    let group_label = if app.view_mode() == ListViewMode::Grouped {
+        " flat  "
+    } else {
+        " group  "
+    };
+    let preview_label = if app.preview_visible() {
+        " hide preview  "
+    } else {
+        " preview  "
+    };
     let spans = vec![
         Span::raw("  "),
         Span::styled("Enter", action_key),
         Span::styled(" open  ", action_label),
+        Span::styled("Tab", action_key),
+        Span::styled(" expand  ", action_label),
+        Span::styled("→", action_key),
+        Span::styled(" focus  ", action_label),
+        Span::styled("G", key_style),
+        Span::styled(group_label, label_style),
+        Span::styled("P", key_style),
+        Span::styled(preview_label, label_style),
         Span::styled("^R", action_key),
         Span::styled(" resume  ", action_label),
-        Span::styled("^X", action_key),
-        Span::styled(" delete  ", action_label),
         Span::styled("?", key_style),
         Span::styled("help  ", label_style),
         Span::styled("Esc", key_style),
@@ -941,7 +978,16 @@ fn render_help_overlay(frame: &mut Frame, is_view_mode: bool, is_single_file_mod
             ("Ctrl+D / U", "Half page down/up"),
             ("PgUp / PgDn", "Jump by page"),
             ("Home / End", "Jump to first/last"),
-            ("Enter", "Open viewer"),
+            ("Enter", "Open viewer / toggle group"),
+            ("Tab", "Expand/collapse group"),
+            ("Shift+Tab", "Collapse all groups"),
+            ("*", "Expand all groups"),
+            ("1-9", "Jump to Nth group"),
+            ("G", "Toggle grouped/flat"),
+            ("P", "Toggle preview pane"),
+            ("→", "Focus preview"),
+            ("←/Esc/h", "Back to list"),
+            ("j/k", "Scroll preview"),
             ("Ctrl+O", "Select and exit"),
             ("Ctrl+W", "Delete word"),
             ("Ctrl+R", "Resume"),
@@ -1012,6 +1058,274 @@ fn render_help_overlay(frame: &mut Frame, is_view_mode: bool, is_single_file_mod
 
     let content = Paragraph::new(lines);
     frame.render_widget(content, inner);
+}
+
+/// Recency-derived status glyph: ●/◐/○/✗ + color.
+fn status_glyph(conv: &crate::history::Conversation) -> (&'static str, Color) {
+    if !conv.parse_errors.is_empty() {
+        return ("✗", Color::Rgb(220, 90, 90));
+    }
+    if let Some(p) = &conv.project_path
+        && !p.exists()
+    {
+        return ("✗", Color::Rgb(220, 90, 90));
+    }
+    let age = Local::now().signed_duration_since(conv.timestamp);
+    let mins = age.num_minutes();
+    if mins <= 10 {
+        ("●", Color::Rgb(120, 200, 130))
+    } else if mins <= 120 {
+        ("◐", Color::Rgb(220, 190, 100))
+    } else {
+        ("○", Color::Rgb(120, 120, 120))
+    }
+}
+
+/// Aggregate group glyph: most recent child wins.
+fn group_status_glyph(group: &crate::history::grouping::ProjectGroup) -> (&'static str, Color) {
+    let mins = Local::now()
+        .signed_duration_since(group.last_activity)
+        .num_minutes();
+    if mins <= 10 {
+        ("●", Color::Rgb(120, 200, 130))
+    } else if mins <= 120 {
+        ("◐", Color::Rgb(220, 190, 100))
+    } else {
+        ("○", Color::Rgb(120, 120, 120))
+    }
+}
+
+fn render_preview_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let focused = app.pane_focus() == PaneFocus::Preview;
+    let border_style = if focused {
+        Style::default().fg(Color::Rgb(78, 201, 176))
+    } else {
+        Style::default().fg(Color::Rgb(60, 60, 60))
+    };
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let lines = app.preview_lines();
+    if lines.is_empty() {
+        let placeholder = Paragraph::new(Line::from(Span::styled(
+            "  (no selection)",
+            Style::default().fg(Color::Rgb(100, 100, 100)),
+        )));
+        frame.render_widget(placeholder, inner);
+        return;
+    }
+
+    let viewport_height = inner.height as usize;
+    let total = lines.len();
+    let scroll = app.preview_scroll().min(total.saturating_sub(viewport_height));
+
+    let visible: Vec<Line> = lines
+        .iter()
+        .skip(scroll)
+        .take(viewport_height)
+        .map(|rl| {
+            let spans: Vec<Span> = rl
+                .spans
+                .iter()
+                .map(|(text, style)| styled_span(text, style))
+                .collect();
+            Line::from(spans)
+        })
+        .collect();
+
+    let para = Paragraph::new(visible);
+    frame.render_widget(para, inner);
+}
+
+fn render_grouped_list(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width as usize;
+    let rows = app.rows();
+    let groups = app.groups();
+    let convs = app.conversations();
+    let separator_str = "─".repeat(width);
+
+    // Compute group display number sequentially across visible headers.
+    let mut header_numbers: Vec<Option<usize>> = vec![None; rows.len()];
+    let mut visible_header_count = 0usize;
+    for (i, row) in rows.iter().enumerate() {
+        if matches!(row, Row::Header { .. }) {
+            visible_header_count += 1;
+            if visible_header_count <= 9 {
+                header_numbers[i] = Some(visible_header_count);
+            }
+        }
+    }
+
+    // One row in `rows` = one ListItem; height varies (header=2, conv=2)
+    let lines_per_item = 2usize;
+    let items_per_page = (area.height as usize) / lines_per_item;
+    let offset = match (app.selected_row(), items_per_page) {
+        (Some(sel), n) if n > 0 => (sel / n) * n,
+        _ => 0,
+    };
+    let visible_count = items_per_page.max(1);
+
+    let items: Vec<ratatui::widgets::ListItem> = rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_count)
+        .map(|(row_idx, row)| {
+            let is_selected = app.selected_row() == Some(row_idx);
+            let list_focused = app.pane_focus() == PaneFocus::List;
+            let selection_bg = if is_selected {
+                if list_focused {
+                    Style::default().bg(Color::Rgb(45, 45, 55))
+                } else {
+                    Style::default().bg(Color::Rgb(35, 35, 40))
+                }
+            } else {
+                Style::default()
+            };
+            let indicator = " ▌ ";
+            let indicator_style = if is_selected {
+                if list_focused {
+                    Style::default().fg(Color::Rgb(78, 201, 176))
+                } else {
+                    Style::default().fg(Color::Rgb(110, 110, 110))
+                }
+            } else {
+                Style::default().fg(Color::Rgb(60, 60, 60))
+            };
+
+            match *row {
+                Row::Header { group_idx } => {
+                    let Some(group) = groups.get(group_idx) else {
+                        return ratatui::widgets::ListItem::new("");
+                    };
+                    let expanded = app.is_group_expanded(group_idx);
+                    let arrow = if expanded { "▼" } else { "▶" };
+                    let (glyph, glyph_color) = group_status_glyph(group);
+
+                    let count = group.conversation_indices.len();
+                    let last_ts = group.last_activity.format("%b %d, %H:%M").to_string();
+                    let group_num = header_numbers[row_idx];
+
+                    let mut spans = vec![Span::styled(indicator, indicator_style)];
+                    spans.push(Span::styled(
+                        format!("{} ", arrow),
+                        Style::default().fg(Color::Rgb(140, 140, 140)),
+                    ));
+                    spans.push(Span::styled(glyph, Style::default().fg(glyph_color)));
+                    spans.push(Span::raw(" "));
+                    if let Some(n) = group_num {
+                        spans.push(Span::styled(
+                            format!("{}. ", n),
+                            Style::default().fg(Color::Rgb(120, 120, 120)),
+                        ));
+                    }
+                    spans.push(Span::styled(
+                        group.display_name.clone(),
+                        Style::default().fg(Color::Rgb(78, 201, 176)).bold(),
+                    ));
+                    spans.push(Span::styled(
+                        format!("  [{}]", count),
+                        Style::default().fg(Color::Rgb(120, 120, 120)),
+                    ));
+
+                    // Right-align timestamp.
+                    let left_len: usize = spans
+                        .iter()
+                        .map(|s| s.content.chars().count())
+                        .sum::<usize>();
+                    let right_len = last_ts.chars().count();
+                    let pad = width.saturating_sub(left_len + right_len + 1);
+                    spans.push(Span::raw(" ".repeat(pad)));
+                    spans.push(Span::styled(
+                        last_ts,
+                        Style::default().fg(Color::Rgb(140, 140, 140)),
+                    ));
+
+                    let header_line = Line::from(spans).style(selection_bg);
+                    let separator = Line::from(Span::styled(
+                        separator_str.as_str(),
+                        Style::default().fg(Color::Rgb(50, 50, 50)),
+                    ));
+                    ratatui::widgets::ListItem::new(vec![header_line, separator])
+                }
+                Row::Conversation { conv_idx, .. } => {
+                    let Some(conv) = convs.get(conv_idx) else {
+                        return ratatui::widgets::ListItem::new("");
+                    };
+                    let (glyph, glyph_color) = status_glyph(conv);
+
+                    let timestamp = if app.use_relative_time() {
+                        format_relative_time(conv.timestamp)
+                    } else {
+                        conv.timestamp.format("%b %d, %H:%M").to_string()
+                    };
+                    let msg_count = if conv.message_count == 1 {
+                        "1 msg".to_string()
+                    } else {
+                        format!("{} msgs", conv.message_count)
+                    };
+
+                    let summary = conv
+                        .summary
+                        .as_ref()
+                        .map(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| {
+                            let p = conv.preview.trim();
+                            if p.is_empty() { "(empty)" } else { p }
+                        });
+
+                    // Indent under header, render glyph + provider badge + summary + meta.
+                    let mut spans = vec![
+                        Span::styled(indicator, indicator_style),
+                        Span::raw("    "),
+                        Span::styled(glyph, Style::default().fg(glyph_color)),
+                        Span::raw(" "),
+                        provider_badge(conv.provider.clone()),
+                    ];
+
+                    let right = format!("{} · {}", msg_count, timestamp);
+                    let left_static_len: usize = spans
+                        .iter()
+                        .map(|s| s.content.chars().count())
+                        .sum::<usize>();
+                    let right_len = right.chars().count();
+                    let avail = width.saturating_sub(left_static_len + right_len + 2);
+                    let summary_truncated: String = if summary.chars().count() > avail {
+                        let truncated: String =
+                            summary.chars().take(avail.saturating_sub(1)).collect();
+                        format!("{}…", truncated)
+                    } else {
+                        summary.to_string()
+                    };
+                    spans.push(Span::styled(
+                        summary_truncated.clone(),
+                        Style::default().fg(Color::White),
+                    ));
+                    let used: usize = left_static_len + summary_truncated.chars().count();
+                    let pad = width.saturating_sub(used + right_len + 1);
+                    spans.push(Span::raw(" ".repeat(pad)));
+                    spans.push(Span::styled(
+                        right,
+                        Style::default().fg(Color::Rgb(140, 140, 140)),
+                    ));
+
+                    let line = Line::from(spans).style(selection_bg);
+                    let separator = Line::from(Span::styled(
+                        separator_str.as_str(),
+                        Style::default().fg(Color::Rgb(50, 50, 50)),
+                    ));
+                    ratatui::widgets::ListItem::new(vec![line, separator])
+                }
+            }
+        })
+        .collect();
+
+    let list = ratatui::widgets::List::new(items);
+    frame.render_widget(list, area);
 }
 
 fn render_list(frame: &mut Frame, app: &App, area: Rect) {

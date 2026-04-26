@@ -34,7 +34,7 @@ const TRUNCATED_BODY_LINES: usize = 3;
 const TRUNCATED_RESULT_LINES: usize = 4;
 
 /// Controls how tool calls and results are displayed
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ToolDisplayMode {
     Hidden,
     #[default]

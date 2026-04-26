@@ -11,6 +11,7 @@
 //! - `parser` - Parsing individual JSONL files
 //! - `path` - Path encoding/decoding utilities
 
+pub mod grouping;
 mod loader;
 mod parser;
 mod path;
@@ -27,7 +28,7 @@ pub use parser::process_conversation_file;
 pub use path::{convert_path_to_project_dir_name, format_short_name_from_path};
 
 /// Identifies which AI tool provider a conversation originated from
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
     Claude,
     Cursor,

@@ -1,6 +1,7 @@
 use crate::claude::LogEntry;
 use crate::debug_log;
 use crate::error::{AppError, Result};
+use crate::history::grouping::{ProjectGroup, group_by_project_path};
 use crate::history::{
     Conversation, LoaderMessage, ProviderKind, format_short_name_from_path,
     process_conversation_file,
@@ -65,6 +66,41 @@ pub enum AppMode {
     List,
     /// View mode - reading a conversation
     View(ViewState),
+}
+
+/// Layout of the conversation list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ListViewMode {
+    /// Original flat list, sorted by recency.
+    Flat,
+    /// Hierarchical dashboard grouped by project path.
+    Grouped,
+}
+
+/// Visible row in the grouped dashboard. Built from `groups` + `expanded_groups`
+/// every time the list state changes; selection is an index into this vector.
+#[derive(Clone, Debug)]
+pub enum Row {
+    /// Group header. `group_idx` indexes into `App::groups`.
+    Header { group_idx: usize },
+    /// Conversation row. `conv_idx` indexes into `App::conversations`.
+    Conversation { group_idx: usize, conv_idx: usize },
+}
+
+/// Which pane currently receives keystrokes (Grouped mode).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PaneFocus {
+    List,
+    Preview,
+}
+
+/// Cache key for the preview render: invalidates when toggles change.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PreviewKey {
+    path: PathBuf,
+    width: usize,
+    tool_display: ToolDisplayMode,
+    show_thinking: bool,
 }
 
 /// State for the conversation viewer
@@ -171,6 +207,24 @@ pub struct App {
     previous_query: String,
     /// Whether to show conversations whose project directory no longer exists
     show_deleted_projects: bool,
+    /// Layout of the conversation list.
+    view_mode: ListViewMode,
+    /// Project groups derived from conversations (Grouped mode only).
+    groups: Vec<ProjectGroup>,
+    /// Canonical paths of currently expanded groups.
+    expanded_groups: std::collections::HashSet<PathBuf>,
+    /// Flattened, expansion-aware view of `groups` for rendering and selection.
+    rows: Vec<Row>,
+    /// Selected index into `rows` (Grouped mode). None when no rows.
+    selected_row: Option<usize>,
+    /// Whether the right preview pane is shown (Grouped mode).
+    preview_visible: bool,
+    /// Which pane currently has focus.
+    pane_focus: PaneFocus,
+    /// Vertical scroll offset for the preview pane.
+    preview_scroll: usize,
+    /// Cached rendered preview lines + key (path/width/toggles).
+    preview_cache: Option<(PreviewKey, Vec<RenderedLine>)>,
 }
 
 impl App {
@@ -189,7 +243,7 @@ impl App {
         let filtered: Vec<usize> = (0..conversations.len()).collect();
         let selected = if filtered.is_empty() { None } else { Some(0) };
 
-        Self {
+        let mut app = Self {
             conversations,
             searchable,
             filtered,
@@ -208,7 +262,18 @@ impl App {
             single_file_mode: false,
             previous_query: String::new(),
             show_deleted_projects,
-        }
+            view_mode: ListViewMode::Grouped,
+            groups: Vec::new(),
+            expanded_groups: std::collections::HashSet::new(),
+            rows: Vec::new(),
+            selected_row: None,
+            preview_visible: true,
+            pane_focus: PaneFocus::List,
+            preview_scroll: 0,
+            preview_cache: None,
+        };
+        app.rebuild_groups();
+        app
     }
 
     /// Create a new app in loading state
@@ -237,6 +302,15 @@ impl App {
             single_file_mode: false,
             previous_query: String::new(),
             show_deleted_projects,
+            view_mode: ListViewMode::Grouped,
+            groups: Vec::new(),
+            expanded_groups: std::collections::HashSet::new(),
+            rows: Vec::new(),
+            selected_row: None,
+            preview_visible: true,
+            pane_focus: PaneFocus::List,
+            preview_scroll: 0,
+            preview_cache: None,
         }
     }
 
@@ -297,6 +371,15 @@ impl App {
             single_file_mode: true,
             previous_query: String::new(),
             show_deleted_projects: true,
+            view_mode: ListViewMode::Flat,
+            groups: Vec::new(),
+            expanded_groups: std::collections::HashSet::new(),
+            rows: Vec::new(),
+            selected_row: None,
+            preview_visible: false,
+            pane_focus: PaneFocus::List,
+            preview_scroll: 0,
+            preview_cache: None,
         }
     }
 
@@ -321,6 +404,10 @@ impl App {
         self.loading_state = LoadingState::Loading {
             loaded: self.conversations.len(),
         };
+
+        if self.view_mode == ListViewMode::Grouped {
+            self.rebuild_groups();
+        }
     }
 
     /// Mark loading as complete: sort, precompute search, and transition to Ready
@@ -351,6 +438,10 @@ impl App {
         } else {
             // User typed during loading, apply the filter now
             self.update_filter();
+        }
+
+        if self.view_mode == ListViewMode::Grouped {
+            self.rebuild_groups();
         }
     }
 
@@ -403,6 +494,220 @@ impl App {
 
         // Cache parsed query words for render performance
         self.refresh_query_words();
+
+        if self.view_mode == ListViewMode::Grouped {
+            self.rebuild_rows();
+            // Reset selection to first visible row when query changes.
+            self.selected_row = if self.rows.is_empty() { None } else { Some(0) };
+        }
+    }
+
+    /// Recompute groups and rebuild the visible row vector.
+    fn rebuild_groups(&mut self) {
+        self.groups = group_by_project_path(&self.conversations);
+
+        // First-time expansion seed: top group expanded so the user sees content.
+        if self.expanded_groups.is_empty()
+            && let Some(first) = self.groups.first()
+            && let Some(path) = first.canonical_path.clone()
+        {
+            self.expanded_groups.insert(path);
+        }
+
+        self.rebuild_rows();
+    }
+
+    /// Build the flat list of visible rows from `groups`, `filtered`, and `expanded_groups`.
+    fn rebuild_rows(&mut self) {
+        let mut rows = Vec::with_capacity(self.groups.len() * 2);
+
+        // When a query is active we want only conversations that survived filtering;
+        // auto-expand groups that have matches and hide groups with none.
+        let query_active = !self.query.is_empty();
+        let allowed: Option<std::collections::HashSet<usize>> = if query_active {
+            Some(self.filtered.iter().copied().collect())
+        } else {
+            None
+        };
+
+        for (gi, group) in self.groups.iter().enumerate() {
+            let visible_children: Vec<usize> = if let Some(ref allowed) = allowed {
+                group
+                    .conversation_indices
+                    .iter()
+                    .copied()
+                    .filter(|idx| allowed.contains(idx))
+                    .collect()
+            } else {
+                group.conversation_indices.clone()
+            };
+
+            // Hide empty groups when filtering.
+            if query_active && visible_children.is_empty() {
+                continue;
+            }
+
+            rows.push(Row::Header { group_idx: gi });
+
+            let expanded = query_active
+                || group
+                    .canonical_path
+                    .as_ref()
+                    .is_some_and(|p| self.expanded_groups.contains(p))
+                || group.canonical_path.is_none() && query_active;
+
+            if expanded {
+                for conv_idx in visible_children {
+                    rows.push(Row::Conversation {
+                        group_idx: gi,
+                        conv_idx,
+                    });
+                }
+            }
+        }
+
+        self.rows = rows;
+
+        // Clamp selection.
+        self.selected_row = match self.selected_row {
+            Some(s) if s < self.rows.len() => Some(s),
+            _ if !self.rows.is_empty() => Some(0),
+            _ => None,
+        };
+    }
+
+    /// Toggle expand/collapse on the currently selected group header.
+    fn toggle_selected_group(&mut self) {
+        let Some(s) = self.selected_row else { return };
+        let group_idx = match self.rows.get(s) {
+            Some(Row::Header { group_idx }) => *group_idx,
+            Some(Row::Conversation { group_idx, .. }) => *group_idx,
+            _ => return,
+        };
+        let Some(path) = self.groups.get(group_idx).and_then(|g| g.canonical_path.clone()) else {
+            return;
+        };
+        if self.expanded_groups.contains(&path) {
+            self.expanded_groups.remove(&path);
+        } else {
+            self.expanded_groups.insert(path);
+        }
+        self.rebuild_rows();
+    }
+
+    fn expand_all_groups(&mut self) {
+        for g in &self.groups {
+            if let Some(p) = &g.canonical_path {
+                self.expanded_groups.insert(p.clone());
+            }
+        }
+        self.rebuild_rows();
+    }
+
+    fn collapse_all_groups(&mut self) {
+        self.expanded_groups.clear();
+        self.rebuild_rows();
+    }
+
+    /// Jump selection to the Nth visible group header (1-based).
+    fn jump_to_group(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut count = 0usize;
+        for (i, row) in self.rows.iter().enumerate() {
+            if matches!(row, Row::Header { .. }) {
+                count += 1;
+                if count == n {
+                    self.selected_row = Some(i);
+                    self.on_selection_changed();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Move row selection up (Grouped mode).
+    fn select_row_prev(&mut self) {
+        if let Some(s) = self.selected_row
+            && s > 0
+        {
+            self.selected_row = Some(s - 1);
+            self.on_selection_changed();
+        }
+    }
+
+    /// Move row selection down (Grouped mode).
+    fn select_row_next(&mut self) {
+        if let Some(s) = self.selected_row
+            && s + 1 < self.rows.len()
+        {
+            self.selected_row = Some(s + 1);
+            self.on_selection_changed();
+        }
+    }
+
+    fn select_row_first(&mut self) {
+        if !self.rows.is_empty() {
+            self.selected_row = Some(0);
+            self.on_selection_changed();
+        }
+    }
+
+    fn select_row_last(&mut self) {
+        if !self.rows.is_empty() {
+            self.selected_row = Some(self.rows.len() - 1);
+            self.on_selection_changed();
+        }
+    }
+
+    fn select_row_page_up(&mut self) {
+        if let Some(s) = self.selected_row {
+            self.selected_row = Some(s.saturating_sub(10));
+            self.on_selection_changed();
+        }
+    }
+
+    fn select_row_page_down(&mut self) {
+        if let Some(s) = self.selected_row {
+            let new = (s + 10).min(self.rows.len().saturating_sub(1));
+            self.selected_row = Some(new);
+            self.on_selection_changed();
+        }
+    }
+
+    fn select_row_half_page_up(&mut self, viewport_height: usize) {
+        if let Some(s) = self.selected_row {
+            self.selected_row = Some(s.saturating_sub(viewport_height / 2));
+            self.on_selection_changed();
+        }
+    }
+
+    fn select_row_half_page_down(&mut self, viewport_height: usize) {
+        if let Some(s) = self.selected_row {
+            let new = (s + viewport_height / 2).min(self.rows.len().saturating_sub(1));
+            self.selected_row = Some(new);
+            self.on_selection_changed();
+        }
+    }
+
+    /// Conversation index for the currently selected row, if it's a conversation.
+    fn selected_row_conv_idx(&self) -> Option<usize> {
+        match self.selected_row.and_then(|s| self.rows.get(s)) {
+            Some(Row::Conversation { conv_idx, .. }) => Some(*conv_idx),
+            _ => None,
+        }
+    }
+
+    /// Toggle between Flat and Grouped list views.
+    fn toggle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ListViewMode::Flat => ListViewMode::Grouped,
+            ListViewMode::Grouped => ListViewMode::Flat,
+        };
+        if self.view_mode == ListViewMode::Grouped {
+            self.rebuild_groups();
+        }
     }
 
     /// Move selection up
@@ -471,6 +776,11 @@ impl App {
 
     /// Get the currently selected conversation path
     fn get_selected_path(&self) -> Option<PathBuf> {
+        if self.view_mode == ListViewMode::Grouped {
+            return self
+                .selected_row_conv_idx()
+                .map(|idx| self.conversations[idx].path.clone());
+        }
         self.selected
             .and_then(|sel| self.filtered.get(sel))
             .map(|&idx| self.conversations[idx].path.clone())
@@ -523,6 +833,175 @@ impl App {
 
     pub fn is_single_file_mode(&self) -> bool {
         self.single_file_mode
+    }
+
+    pub fn view_mode(&self) -> ListViewMode {
+        self.view_mode
+    }
+
+    pub fn groups(&self) -> &[ProjectGroup] {
+        &self.groups
+    }
+
+    pub fn rows(&self) -> &[Row] {
+        &self.rows
+    }
+
+    pub fn selected_row(&self) -> Option<usize> {
+        self.selected_row
+    }
+
+    pub fn is_selected_row_header(&self) -> bool {
+        matches!(
+            self.selected_row.and_then(|s| self.rows.get(s)),
+            Some(Row::Header { .. })
+        )
+    }
+
+    pub fn preview_visible(&self) -> bool {
+        self.preview_visible
+    }
+
+    pub fn pane_focus(&self) -> PaneFocus {
+        self.pane_focus
+    }
+
+    pub fn preview_scroll(&self) -> usize {
+        self.preview_scroll
+    }
+
+    /// Read the cached preview lines (built earlier by `ensure_preview`).
+    pub fn preview_lines(&self) -> &[RenderedLine] {
+        self.preview_cache
+            .as_ref()
+            .map(|(_, l)| l.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn toggle_preview_pane(&mut self) {
+        self.preview_visible = !self.preview_visible;
+        if !self.preview_visible {
+            self.pane_focus = PaneFocus::List;
+        }
+    }
+
+    pub fn focus_preview(&mut self) {
+        if self.preview_visible {
+            self.pane_focus = PaneFocus::Preview;
+        }
+    }
+
+    pub fn focus_list(&mut self) {
+        self.pane_focus = PaneFocus::List;
+    }
+
+    /// Build/get cached preview lines for the currently selected row.
+    pub fn ensure_preview(
+        &mut self,
+        width: usize,
+        providers: &[Box<dyn Provider>],
+    ) -> &[RenderedLine] {
+        use crate::tui::preview;
+        use crate::tui::viewer::RenderOptions;
+
+        let Some(s) = self.selected_row else {
+            self.preview_cache = None;
+            return &[];
+        };
+        let Some(row) = self.rows.get(s).cloned() else {
+            self.preview_cache = None;
+            return &[];
+        };
+
+        match row {
+            Row::Header { group_idx } => {
+                if let Some(group) = self.groups.get(group_idx) {
+                    let lines = preview::build_group_preview(group, &self.conversations, width);
+                    let key = PreviewKey {
+                        path: PathBuf::from(format!("__group__{}", group_idx)),
+                        width,
+                        tool_display: self.tool_display,
+                        show_thinking: self.show_thinking,
+                    };
+                    self.preview_cache = Some((key, lines));
+                } else {
+                    self.preview_cache = None;
+                }
+            }
+            Row::Conversation { conv_idx, .. } => {
+                let Some(conv) = self.conversations.get(conv_idx).cloned() else {
+                    self.preview_cache = None;
+                    return &[];
+                };
+                let key = PreviewKey {
+                    path: conv.path.clone(),
+                    width,
+                    tool_display: self.tool_display,
+                    show_thinking: self.show_thinking,
+                };
+                let needs_rebuild = self
+                    .preview_cache
+                    .as_ref()
+                    .is_none_or(|(k, _)| k != &key);
+                if needs_rebuild {
+                    let (assistant_label, assistant_color, assistant_dim_color) =
+                        match conv.provider {
+                            ProviderKind::Claude => {
+                                ("Claude".to_string(), (218, 119, 86), (170, 93, 67))
+                            }
+                            ProviderKind::Cursor => {
+                                ("Cursor IDE".to_string(), (180, 130, 230), (140, 100, 180))
+                            }
+                            ProviderKind::CursorAgent => {
+                                ("Cursor CLI".to_string(), (94, 184, 255), (72, 140, 194))
+                            }
+                        };
+                    let options = RenderOptions {
+                        tool_display: self.tool_display,
+                        show_thinking: self.show_thinking,
+                        show_timing: false,
+                        content_width: width,
+                        assistant_label,
+                        assistant_color,
+                        assistant_dim_color,
+                    };
+                    match preview::build_preview(&conv, providers, &options) {
+                        Ok(lines) => self.preview_cache = Some((key, lines)),
+                        Err(_) => self.preview_cache = None,
+                    }
+                }
+            }
+        }
+
+        self.preview_cache
+            .as_ref()
+            .map(|(_, l)| l.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Reset preview scroll and invalidate when the user moves selection.
+    fn on_selection_changed(&mut self) {
+        self.preview_scroll = 0;
+        // cache is keyed on path; will rebuild on next ensure_preview if path differs
+    }
+
+    fn preview_scroll_down(&mut self, amount: usize) {
+        self.preview_scroll = self.preview_scroll.saturating_add(amount);
+    }
+
+    fn preview_scroll_up(&mut self, amount: usize) {
+        self.preview_scroll = self.preview_scroll.saturating_sub(amount);
+    }
+
+
+    pub fn is_group_expanded(&self, group_idx: usize) -> bool {
+        let Some(group) = self.groups.get(group_idx) else {
+            return false;
+        };
+        match &group.canonical_path {
+            Some(p) => self.expanded_groups.contains(p) || !self.query.is_empty(),
+            None => !self.query.is_empty(),
+        }
     }
 
     /// Move cursor left by one character
@@ -628,6 +1107,10 @@ impl App {
             self.selected = Some(self.filtered.len() - 1);
         }
         // else: selected stays the same (now pointing to next item)
+
+        if self.view_mode == ListViewMode::Grouped {
+            self.rebuild_groups();
+        }
     }
 
     /// Handle a key event during confirmation mode
@@ -1222,6 +1705,95 @@ impl App {
             };
         }
 
+        // Grouped mode has its own selection vector and a few extra keys.
+        if self.view_mode == ListViewMode::Grouped {
+            // Preview-pane focused: scroll keys go to preview, not the list.
+            if self.pane_focus == PaneFocus::Preview {
+                match code {
+                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                        self.focus_list();
+                        return None;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        self.preview_scroll_down(1);
+                        return None;
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        self.preview_scroll_up(1);
+                        return None;
+                    }
+                    KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.preview_scroll_down(viewport_height / 2);
+                        return None;
+                    }
+                    KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.preview_scroll_up(viewport_height / 2);
+                        return None;
+                    }
+                    KeyCode::PageDown => {
+                        self.preview_scroll_down(viewport_height);
+                        return None;
+                    }
+                    KeyCode::PageUp => {
+                        self.preview_scroll_up(viewport_height);
+                        return None;
+                    }
+                    KeyCode::Char('g') => {
+                        self.preview_scroll = 0;
+                        return None;
+                    }
+                    KeyCode::Char('G') if !modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.preview_scroll = usize::MAX;
+                        return None;
+                    }
+                    KeyCode::Char('q') | KeyCode::Char('c')
+                        if modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        return Some(Action::Quit);
+                    }
+                    _ => return None,
+                }
+            }
+
+            // Group-mode hotkeys handled before generic typing so they aren't shadowed.
+            match code {
+                KeyCode::Tab => {
+                    self.toggle_selected_group();
+                    return None;
+                }
+                KeyCode::BackTab => {
+                    self.collapse_all_groups();
+                    return None;
+                }
+                KeyCode::Char('*') => {
+                    self.expand_all_groups();
+                    return None;
+                }
+                KeyCode::Char('G') if !modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.toggle_view_mode();
+                    return None;
+                }
+                KeyCode::Char('P') => {
+                    self.toggle_preview_pane();
+                    return None;
+                }
+                KeyCode::Right if self.preview_visible && self.query.is_empty() => {
+                    self.focus_preview();
+                    return None;
+                }
+                KeyCode::Char(c)
+                    if c.is_ascii_digit()
+                        && c != '0'
+                        && self.query.is_empty()
+                        && !modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.jump_to_group(c.to_digit(10).unwrap_or(0) as usize);
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         // Normal handling when ready
         match code {
             KeyCode::Esc => Some(Action::Quit),
@@ -1236,46 +1808,86 @@ impl App {
                 None
             }
             KeyCode::Up => {
-                self.select_prev();
+                if self.view_mode == ListViewMode::Grouped {
+                    self.select_row_prev();
+                } else {
+                    self.select_prev();
+                }
                 None
             }
             KeyCode::Down => {
-                self.select_next();
+                if self.view_mode == ListViewMode::Grouped {
+                    self.select_row_next();
+                } else {
+                    self.select_next();
+                }
                 None
             }
             KeyCode::Home => {
-                self.select_first();
+                if self.view_mode == ListViewMode::Grouped {
+                    self.select_row_first();
+                } else {
+                    self.select_first();
+                }
                 None
             }
             KeyCode::End => {
-                self.select_last();
+                if self.view_mode == ListViewMode::Grouped {
+                    self.select_row_last();
+                } else {
+                    self.select_last();
+                }
                 None
             }
             KeyCode::PageUp => {
-                self.select_page_up();
+                if self.view_mode == ListViewMode::Grouped {
+                    self.select_row_page_up();
+                } else {
+                    self.select_page_up();
+                }
                 None
             }
             KeyCode::PageDown => {
-                self.select_page_down();
+                if self.view_mode == ListViewMode::Grouped {
+                    self.select_row_page_down();
+                } else {
+                    self.select_page_down();
+                }
                 None
             }
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(Action::Quit),
             KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.select_next();
+                if self.view_mode == ListViewMode::Grouped {
+                    self.select_row_next();
+                } else {
+                    self.select_next();
+                }
                 None
             }
             KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.select_prev();
+                if self.view_mode == ListViewMode::Grouped {
+                    self.select_row_prev();
+                } else {
+                    self.select_prev();
+                }
                 None
             }
             // Ctrl+D - half page down (vim-style)
             KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.select_half_page_down(viewport_height);
+                if self.view_mode == ListViewMode::Grouped {
+                    self.select_row_half_page_down(viewport_height);
+                } else {
+                    self.select_half_page_down(viewport_height);
+                }
                 None
             }
             // Ctrl+U - half page up (vim-style)
             KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                self.select_half_page_up(viewport_height);
+                if self.view_mode == ListViewMode::Grouped {
+                    self.select_row_half_page_up(viewport_height);
+                } else {
+                    self.select_half_page_up(viewport_height);
+                }
                 None
             }
             // Ctrl+X - delete conversation
@@ -1352,11 +1964,19 @@ impl App {
     pub fn enter_view_mode(&mut self, content_width: usize, providers: &[Box<dyn Provider>]) {
         use crate::tui::viewer::{RenderOptions, render_entries};
 
-        let Some(selected) = self.selected else {
-            return;
-        };
-        let Some(&conv_idx) = self.filtered.get(selected) else {
-            return;
+        let conv_idx = if self.view_mode == ListViewMode::Grouped {
+            match self.selected_row_conv_idx() {
+                Some(idx) => idx,
+                None => return,
+            }
+        } else {
+            let Some(selected) = self.selected else {
+                return;
+            };
+            let Some(&idx) = self.filtered.get(selected) else {
+                return;
+            };
+            idx
         };
         let conv = &self.conversations[conv_idx];
         let path = conv.path.clone();
@@ -1685,6 +2305,16 @@ pub fn run(
         // Check for resize in view mode
         app.check_view_resize(content_width, viewport_height, providers);
 
+        // Pre-build preview lines so the renderer (which only takes &App) can read them.
+        if matches!(app.app_mode(), AppMode::List)
+            && app.view_mode() == ListViewMode::Grouped
+            && app.preview_visible()
+            && (frame_area.width as usize) >= 100
+        {
+            let preview_width = (frame_area.width as usize) / 2;
+            app.ensure_preview(preview_width.saturating_sub(4), providers);
+        }
+
         guard.terminal.draw(|frame| ui::render(frame, &app))?;
 
         if let Event::Key(key) = event::read().map_err(|e| AppError::Io(io::Error::other(e)))? {
@@ -1695,10 +2325,20 @@ pub fn run(
                     && *app.dialog_mode() == DialogMode::None
                     && key.code == KeyCode::Enter
                     && !app.is_loading()
-                    && app.selected().is_some()
                 {
-                    app.enter_view_mode(content_width, providers);
-                    continue;
+                    if app.view_mode() == ListViewMode::Grouped {
+                        if app.is_selected_row_header() {
+                            app.toggle_selected_group();
+                            continue;
+                        }
+                        if app.selected_row().is_some() {
+                            app.enter_view_mode(content_width, providers);
+                            continue;
+                        }
+                    } else if app.selected().is_some() {
+                        app.enter_view_mode(content_width, providers);
+                        continue;
+                    }
                 }
 
                 if let Some(action) =
@@ -1819,6 +2459,15 @@ pub fn run_with_loader(
 
         // Check for resize in view mode
         app.check_view_resize(content_width, viewport_height, providers);
+
+        if matches!(app.app_mode(), AppMode::List)
+            && app.view_mode() == ListViewMode::Grouped
+            && app.preview_visible()
+            && (frame_area.width as usize) >= 100
+        {
+            let preview_width = (frame_area.width as usize) / 2;
+            app.ensure_preview(preview_width.saturating_sub(4), providers);
+        }
 
         // Render current state
         guard.terminal.draw(|frame| ui::render(frame, &app))?;
