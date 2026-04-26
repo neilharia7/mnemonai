@@ -10,12 +10,13 @@ mod history;
 mod markdown;
 mod pager;
 mod providers;
+mod prune;
 mod syntax;
 mod tool_format;
 mod tui;
 
 use clap::Parser;
-use cli::Args;
+use cli::{Args, Commands};
 use error::{AppError, Result};
 use history::LoaderMessage;
 use providers::Provider;
@@ -119,6 +120,15 @@ fn run() -> Result<()> {
         Box::new(providers::cursor_agent::CursorAgentProvider::new()),
         Box::new(providers::cursor::CursorProvider::new()),
     ];
+
+    // Handle subcommands before falling through to the TUI browse flow.
+    if let Some(command) = args.command {
+        match command {
+            Commands::Prune(prune_args) => {
+                return prune::run(prune_args, &providers);
+            }
+        }
+    }
 
     // Handle --render flag: render a JSONL file in ledger format and exit
     if let Some(ref render_path) = args.render {

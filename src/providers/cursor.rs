@@ -600,6 +600,23 @@ fn build_conversation(
         .cloned()
         .unwrap_or_else(|| preview.clone());
 
+    let bubble_created_at = |key: &String| -> Option<DateTime<Local>> {
+        let v = bubble_map.get(key)?;
+        let created_at = v.get("createdAt")?.as_str()?;
+        DateTime::parse_from_rfc3339(created_at)
+            .ok()
+            .map(|dt| dt.with_timezone(&Local))
+    };
+
+    let first_message_time = bubble_created_at(&info.first_key);
+    let last_message_time = bubble_created_at(&info.preview_key)
+        .or_else(|| {
+            info.user_preview_key
+                .as_ref()
+                .and_then(bubble_created_at)
+        })
+        .or(first_message_time);
+
     Some(Conversation {
         path: fake_path,
         index: 0,
@@ -617,6 +634,8 @@ fn build_conversation(
         model,
         total_tokens: 0,
         duration_minutes: None,
+        first_message_time,
+        last_message_time,
         search_text_lower: None,
         search_topic_end: None,
     })

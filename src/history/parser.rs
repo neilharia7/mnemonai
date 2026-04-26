@@ -319,6 +319,9 @@ pub(crate) fn process_conversation_reader<R: BufRead>(
         .unwrap_or("unknown")
         .to_string();
 
+    let first_message_time = first_timestamp.map(|ts| ts.with_timezone(&Local));
+    let last_message_time = last_timestamp.map(|ts| ts.with_timezone(&Local));
+
     Ok(Some(Conversation {
         path,
         index: 0,
@@ -336,6 +339,8 @@ pub(crate) fn process_conversation_reader<R: BufRead>(
         model: extracted_model,
         total_tokens,
         duration_minutes,
+        first_message_time,
+        last_message_time,
         search_text_lower: None,
         search_topic_end: None,
     }))

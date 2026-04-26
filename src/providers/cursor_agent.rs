@@ -496,6 +496,9 @@ fn process_transcript_file(
         .as_ref()
         .map(|workspace| format_short_name_from_path(workspace));
 
+    let first_message_time = first_timestamp.map(|ts| ts.with_timezone(&Local));
+    let last_message_time = last_timestamp.map(|ts| ts.with_timezone(&Local));
+
     Ok(Some(Conversation {
         path,
         index: 0,
@@ -513,6 +516,8 @@ fn process_transcript_file(
         model: None,
         total_tokens: 0,
         duration_minutes,
+        first_message_time,
+        last_message_time,
         search_text_lower: None,
         search_topic_end: None,
     }))
@@ -888,6 +893,8 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            first_message_time: None,
+            last_message_time: None,
             search_text_lower: None,
             search_topic_end: None,
         };

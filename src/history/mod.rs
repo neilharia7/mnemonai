@@ -73,6 +73,10 @@ pub struct Conversation {
     pub total_tokens: u64,
     /// Conversation duration in minutes (from first to last message)
     pub duration_minutes: Option<u64>,
+    /// Timestamp of the first parsed message, when available.
+    pub first_message_time: Option<DateTime<Local>>,
+    /// Timestamp of the last parsed message, when available.
+    pub last_message_time: Option<DateTime<Local>>,
     /// Cached lowercased full text for search, when loaded from the persistent index.
     pub search_text_lower: Option<String>,
     /// Cached byte offset where the topic window ends in `search_text_lower`.

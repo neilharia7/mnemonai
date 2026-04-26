@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -153,4 +153,74 @@ pub struct Args {
         conflicts_with_all = ["local", "show_dir", "resume", "show_path", "show_id", "plain", "render"]
     )]
     pub input_file: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Delete conversations older than a cutoff time
+    Prune(PruneArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct PruneArgs {
+    /// Delete conversations older than the given duration (e.g. "30d", "12w", "6m")
+    #[arg(long, value_name = "DURATION", group = "cutoff")]
+    pub older_than: Option<String>,
+
+    /// Delete conversations whose timestamp is before the given local date (YYYY-MM-DD)
+    #[arg(long, value_name = "DATE", group = "cutoff")]
+    pub before: Option<String>,
+
+    /// Restrict to a specific provider
+    #[arg(long, value_enum)]
+    pub provider: Option<ProviderFilter>,
+
+    /// Only prune conversations whose project path contains this substring
+    #[arg(long, value_name = "SUBSTRING")]
+    pub project: Option<String>,
+
+    /// Which timestamp to compare (defaults to last-message)
+    #[arg(long, value_enum, default_value_t = TimestampSource::LastMessage)]
+    pub r#use: TimestampSource,
+
+    /// Skip files modified within this duration (default 5m, format like 5m, 1h, 30s)
+    #[arg(long, value_name = "DURATION", default_value = "5m")]
+    pub min_age: String,
+
+    /// Print the list of conversations that would be deleted, then exit
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip the interactive confirmation prompt
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+
+    /// Move deletions to a trash directory instead of removing them
+    #[arg(long)]
+    pub trash: bool,
+
+    /// Include conversations from deleted project directories (default: include)
+    #[arg(long)]
+    pub exclude_deleted_projects: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ProviderFilter {
+    Claude,
+    Cursor,
+    CursorAgent,
+    All,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum TimestampSource {
+    /// File modification time (cheap, sometimes inaccurate)
+    Mtime,
+    /// First message timestamp parsed from the conversation
+    FirstMessage,
+    /// Last message timestamp parsed from the conversation
+    LastMessage,
 }

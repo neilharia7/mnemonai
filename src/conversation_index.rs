@@ -12,7 +12,7 @@ use std::fs::Metadata;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SourceFingerprint {
@@ -81,10 +81,11 @@ where
                 schema_version, provider, show_last, source_path, source_mtime_millis,
                 source_size, id, timestamp, preview, full_text, search_text_lower,
                 search_topic_end, project_name, project_path, cwd, message_count,
-                parse_errors_json, summary, model, total_tokens, duration_minutes
+                parse_errors_json, summary, model, total_tokens, duration_minutes,
+                first_message_millis, last_message_millis
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19, ?20, ?21
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
             )",
         ) {
             Ok(stmt) => stmt,
@@ -129,6 +130,12 @@ where
                     conversation
                         .duration_minutes
                         .map(|v| v.min(i64::MAX as u64) as i64),
+                    conversation
+                        .first_message_time
+                        .map(|t| t.timestamp_millis()),
+                    conversation
+                        .last_message_time
+                        .map(|t| t.timestamp_millis()),
                 ])
                 .is_err()
             {
@@ -161,7 +168,7 @@ fn load_provider_cache_from_conn(
             source_path, source_mtime_millis, source_size, id, timestamp, preview,
             full_text, search_text_lower, search_topic_end, project_name, project_path,
             cwd, message_count, parse_errors_json, summary, model, total_tokens,
-            duration_minutes
+            duration_minutes, first_message_millis, last_message_millis
          FROM file_conversations
          WHERE schema_version = ?1 AND provider = ?2 AND show_last = ?3",
     )?;
@@ -184,6 +191,8 @@ fn load_provider_cache_from_conn(
             let parse_errors = serde_json::from_str(&parse_errors_json).unwrap_or_default();
             let total_tokens: i64 = row.get(16)?;
             let duration_minutes: Option<i64> = row.get(17)?;
+            let first_message_millis: Option<i64> = row.get(18)?;
+            let last_message_millis: Option<i64> = row.get(19)?;
 
             Ok((
                 PathBuf::from(&source_path),
@@ -211,6 +220,8 @@ fn load_provider_cache_from_conn(
                         model: row.get(15)?,
                         total_tokens: total_tokens.max(0) as u64,
                         duration_minutes: duration_minutes.map(|v| v.max(0) as u64),
+                        first_message_time: first_message_millis.and_then(millis_to_local),
+                        last_message_time: last_message_millis.and_then(millis_to_local),
                     },
                 },
             ))
@@ -257,9 +268,19 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              model                 TEXT,
              total_tokens          INTEGER NOT NULL,
              duration_minutes      INTEGER,
+             first_message_millis  INTEGER,
+             last_message_millis   INTEGER,
              PRIMARY KEY (schema_version, provider, show_last, source_path)
          );",
     )
+}
+
+fn millis_to_local(millis: i64) -> Option<DateTime<Local>> {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_millis_opt(millis)
+        .single()
+        .map(|dt| dt.with_timezone(&Local))
 }
 
 fn provider_key(provider: &ProviderKind) -> &'static str {
@@ -307,6 +328,8 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            first_message_time: None,
+            last_message_time: None,
             search_text_lower: None,
             search_topic_end: None,
         }
@@ -429,10 +452,11 @@ mod tests {
                 schema_version, provider, show_last, source_path, source_mtime_millis,
                 source_size, id, timestamp, preview, full_text, search_text_lower,
                 search_topic_end, project_name, project_path, cwd, message_count,
-                parse_errors_json, summary, model, total_tokens, duration_minutes
+                parse_errors_json, summary, model, total_tokens, duration_minutes,
+                first_message_millis, last_message_millis
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19, ?20, ?21
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
             )",
         )?;
 
@@ -460,6 +484,8 @@ mod tests {
                 conversation.model.as_deref(),
                 conversation.total_tokens as i64,
                 conversation.duration_minutes.map(|v| v as i64),
+                conversation.first_message_time.map(|t| t.timestamp_millis()),
+                conversation.last_message_time.map(|t| t.timestamp_millis()),
             ])?;
         }
 

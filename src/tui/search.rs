@@ -300,6 +300,8 @@ mod tests {
             model: None,
             total_tokens: 0,
             duration_minutes: None,
+            first_message_time: None,
+            last_message_time: None,
             search_text_lower: None,
             search_topic_end: None,
         }
