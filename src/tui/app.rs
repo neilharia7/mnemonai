@@ -14,6 +14,7 @@ use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
+use std::cell::Cell;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
@@ -223,6 +224,9 @@ pub struct App {
     pane_focus: PaneFocus,
     /// Vertical scroll offset for the preview pane.
     preview_scroll: usize,
+    /// Last viewport height used to render the preview pane. Set during render
+    /// so scroll handlers can clamp without needing the layout reference.
+    preview_viewport_height: Cell<usize>,
     /// Cached rendered preview lines + key (path/width/toggles).
     preview_cache: Option<(PreviewKey, Vec<RenderedLine>)>,
 }
@@ -270,6 +274,7 @@ impl App {
             preview_visible: true,
             pane_focus: PaneFocus::List,
             preview_scroll: 0,
+            preview_viewport_height: Cell::new(0),
             preview_cache: None,
         };
         app.rebuild_groups();
@@ -310,6 +315,7 @@ impl App {
             preview_visible: true,
             pane_focus: PaneFocus::List,
             preview_scroll: 0,
+            preview_viewport_height: Cell::new(0),
             preview_cache: None,
         }
     }
@@ -379,6 +385,7 @@ impl App {
             preview_visible: false,
             pane_focus: PaneFocus::List,
             preview_scroll: 0,
+            preview_viewport_height: Cell::new(0),
             preview_cache: None,
         }
     }
@@ -985,12 +992,30 @@ impl App {
         // cache is keyed on path; will rebuild on next ensure_preview if path differs
     }
 
+    /// Maximum valid scroll offset given current preview content + viewport.
+    fn preview_max_scroll(&self) -> usize {
+        let total = self.preview_lines().len();
+        let viewport = self.preview_viewport_height.get();
+        total.saturating_sub(viewport)
+    }
+
+    /// Cache the preview viewport height observed at render time so scroll
+    /// handlers (and `G`) can clamp without a layout reference.
+    pub fn set_preview_viewport_height(&self, height: usize) {
+        self.preview_viewport_height.set(height);
+    }
+
     fn preview_scroll_down(&mut self, amount: usize) {
-        self.preview_scroll = self.preview_scroll.saturating_add(amount);
+        let max = self.preview_max_scroll();
+        self.preview_scroll = self.preview_scroll.saturating_add(amount).min(max);
     }
 
     fn preview_scroll_up(&mut self, amount: usize) {
         self.preview_scroll = self.preview_scroll.saturating_sub(amount);
+    }
+
+    fn preview_scroll_to_bottom(&mut self) {
+        self.preview_scroll = self.preview_max_scroll();
     }
 
 
@@ -1723,19 +1748,23 @@ impl App {
                         return None;
                     }
                     KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.preview_scroll_down(viewport_height / 2);
+                        let pv = self.preview_viewport_height.get().max(1);
+                        self.preview_scroll_down(pv / 2);
                         return None;
                     }
                     KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.preview_scroll_up(viewport_height / 2);
+                        let pv = self.preview_viewport_height.get().max(1);
+                        self.preview_scroll_up(pv / 2);
                         return None;
                     }
                     KeyCode::PageDown => {
-                        self.preview_scroll_down(viewport_height);
+                        let pv = self.preview_viewport_height.get().max(1);
+                        self.preview_scroll_down(pv);
                         return None;
                     }
                     KeyCode::PageUp => {
-                        self.preview_scroll_up(viewport_height);
+                        let pv = self.preview_viewport_height.get().max(1);
+                        self.preview_scroll_up(pv);
                         return None;
                     }
                     KeyCode::Char('g') => {
@@ -1743,7 +1772,7 @@ impl App {
                         return None;
                     }
                     KeyCode::Char('G') if !modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.preview_scroll = usize::MAX;
+                        self.preview_scroll_to_bottom();
                         return None;
                     }
                     KeyCode::Char('q') | KeyCode::Char('c')

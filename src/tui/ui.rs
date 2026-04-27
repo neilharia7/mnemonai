@@ -8,7 +8,10 @@ use chrono::{DateTime, Local};
 use chrono_humanize::{Accuracy, HumanTime, Tense};
 use ratatui::layout::Position;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 
 /// Lines per conversation item (header + preview + separator)
 const LINES_PER_ITEM: usize = 3;
@@ -1110,6 +1113,7 @@ fn render_preview_pane(frame: &mut Frame, app: &App, area: Rect) {
 
     let lines = app.preview_lines();
     if lines.is_empty() {
+        app.set_preview_viewport_height(inner.height as usize);
         let placeholder = Paragraph::new(Line::from(Span::styled(
             "  (no selection)",
             Style::default().fg(Color::Rgb(100, 100, 100)),
@@ -1118,9 +1122,26 @@ fn render_preview_pane(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    // Reserve a 1-col gutter on the right for the scrollbar when content overflows.
     let viewport_height = inner.height as usize;
     let total = lines.len();
-    let scroll = app.preview_scroll().min(total.saturating_sub(viewport_height));
+    let overflow = total > viewport_height;
+
+    app.set_preview_viewport_height(viewport_height);
+
+    let max_scroll = total.saturating_sub(viewport_height);
+    let scroll = app.preview_scroll().min(max_scroll);
+
+    let content_area = if overflow && inner.width > 1 {
+        Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width - 1,
+            height: inner.height,
+        }
+    } else {
+        inner
+    };
 
     let visible: Vec<Line> = lines
         .iter()
@@ -1137,7 +1158,23 @@ fn render_preview_pane(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let para = Paragraph::new(visible);
-    frame.render_widget(para, inner);
+    frame.render_widget(para, content_area);
+
+    if overflow {
+        let scrollbar_color = if focused {
+            Color::Rgb(78, 201, 176)
+        } else {
+            Color::Rgb(90, 90, 90)
+        };
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(Some("│"))
+            .thumb_symbol("█")
+            .style(Style::default().fg(scrollbar_color));
+        let mut state = ScrollbarState::new(max_scroll).position(scroll);
+        frame.render_stateful_widget(scrollbar, inner, &mut state);
+    }
 }
 
 fn render_grouped_list(frame: &mut Frame, app: &App, area: Rect) {
