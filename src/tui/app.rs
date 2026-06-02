@@ -698,11 +698,17 @@ impl App {
         }
     }
 
-    /// Conversation index for the currently selected row, if it's a conversation.
+    /// Conversation index for the currently selected row.
+    /// If the selected row is a group header, falls through to the group's
+    /// most recent conversation so resume/delete/select still target something useful.
     fn selected_row_conv_idx(&self) -> Option<usize> {
         match self.selected_row.and_then(|s| self.rows.get(s)) {
             Some(Row::Conversation { conv_idx, .. }) => Some(*conv_idx),
-            _ => None,
+            Some(Row::Header { group_idx }) => self
+                .groups
+                .get(*group_idx)
+                .and_then(|g| g.conversation_indices.first().copied()),
+            None => None,
         }
     }
 
@@ -1779,6 +1785,23 @@ impl App {
                         if modifiers.contains(KeyModifiers::CONTROL) =>
                     {
                         return Some(Action::Quit);
+                    }
+                    // Conversation actions still work while preview is focused —
+                    // the selected row in the list is the natural target.
+                    KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        return self.get_selected_path().map(Action::Resume);
+                    }
+                    KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        return self.get_selected_path().map(Action::Select);
+                    }
+                    KeyCode::Char('x') if modifiers.contains(KeyModifiers::CONTROL) => {
+                        if self.get_selected_path().is_some() {
+                            self.dialog_mode = DialogMode::ConfirmDelete;
+                        }
+                        return None;
+                    }
+                    KeyCode::Enter => {
+                        return self.get_selected_path().map(Action::Select);
                     }
                     _ => return None,
                 }
