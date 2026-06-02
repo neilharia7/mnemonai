@@ -11,6 +11,7 @@ use crate::tui::search::{self, SearchableConversation};
 use crate::tui::ui;
 use crate::tui::viewer::ToolDisplayMode;
 use chrono::Local;
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::prelude::*;
@@ -996,6 +997,12 @@ impl App {
     fn on_selection_changed(&mut self) {
         self.preview_scroll = 0;
         // cache is keyed on path; will rebuild on next ensure_preview if path differs
+    }
+
+    /// Drop the preview cache so the next `ensure_preview` re-reads from disk.
+    /// Used after a resumed session writes new messages to the same file.
+    pub fn invalidate_preview(&mut self) {
+        self.preview_cache = None;
     }
 
     /// Maximum valid scroll offset given current preview content + viewport.
@@ -2320,6 +2327,91 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Hand the terminal back to a child process (e.g. `claude --resume`) by leaving the
+/// alternate screen, restoring the cursor, and disabling raw mode. The TUI remains
+/// alive in the parent process; pair with `resume_terminal` once the child exits.
+fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    terminal::disable_raw_mode().map_err(|e| AppError::Io(io::Error::other(e)))?;
+    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen, Show)
+        .map_err(|e| AppError::Io(io::Error::other(e)))?;
+    Ok(())
+}
+
+/// Re-acquire the terminal after a foregrounded child has returned: re-enter the
+/// alternate screen, hide the cursor, re-enable raw mode, and force a full repaint.
+fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    terminal::enable_raw_mode().map_err(|e| AppError::Io(io::Error::other(e)))?;
+    crossterm::execute!(terminal.backend_mut(), EnterAlternateScreen, Hide)
+        .map_err(|e| AppError::Io(io::Error::other(e)))?;
+    terminal
+        .clear()
+        .map_err(|e| AppError::Io(io::Error::other(e)))?;
+    Ok(())
+}
+
+/// Drain any keystrokes the child process left in the input buffer so they don't
+/// accidentally fire dashboard shortcuts on return.
+fn drain_pending_events() {
+    while let Ok(true) = event::poll(Duration::from_millis(0)) {
+        if event::read().is_err() {
+            break;
+        }
+    }
+}
+
+/// Run the appropriate provider's resume command for `path`, suspending and restoring
+/// the TUI around the call. Errors are logged but never propagated — the dashboard
+/// always comes back so the user is never stranded on the shell.
+fn handle_resume_action(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    path: &std::path::Path,
+    providers: &[Box<dyn Provider>],
+    default_args: &[String],
+) {
+    let _ = debug_log::log_selected_path(path);
+
+    let conv = app
+        .conversations()
+        .iter()
+        .find(|c| c.path == path)
+        .cloned();
+    let Some(conv) = conv else {
+        let _ = debug_log::log_debug(&format!(
+            "Resume requested for unknown conversation: {}",
+            path.display()
+        ));
+        return;
+    };
+    let Some(provider) = providers.iter().find(|p| p.kind() == conv.provider) else {
+        let _ = debug_log::log_debug(&format!(
+            "Resume requested but no provider registered for {:?}",
+            conv.provider
+        ));
+        return;
+    };
+
+    if let Err(err) = suspend_terminal(terminal) {
+        let _ = debug_log::log_debug(&format!("Failed to suspend terminal for resume: {}", err));
+        return;
+    }
+
+    let resume_result = provider.resume(&conv, default_args);
+
+    if let Err(err) = resume_terminal(terminal) {
+        let _ = debug_log::log_debug(&format!("Failed to resume terminal after resume: {}", err));
+    }
+    drain_pending_events();
+
+    if let Err(err) = resume_result {
+        let _ = debug_log::log_debug(&format!("Resume command failed: {}", err));
+    }
+
+    // The resumed session almost always appends new messages to the same file,
+    // so drop any cached preview lines and let the next frame rebuild from disk.
+    app.invalidate_preview();
+}
+
 /// Name column width for ledger-style display
 const NAME_WIDTH: usize = 9;
 
@@ -2331,6 +2423,7 @@ pub fn run(
     show_thinking: bool,
     show_deleted_projects: bool,
     providers: &[Box<dyn Provider>],
+    default_args: &[String],
 ) -> Result<Action> {
     // Set up panic hook to restore terminal
     let original_hook = std::panic::take_hook();
@@ -2430,8 +2523,14 @@ pub fn run(
                             return Ok(action);
                         }
                         Action::Resume(ref path) => {
-                            let _ = debug_log::log_selected_path(path);
-                            return Ok(action);
+                            let path = path.clone();
+                            handle_resume_action(
+                                &mut app,
+                                &mut guard.terminal,
+                                &path,
+                                providers,
+                                default_args,
+                            );
                         }
                         Action::Quit => return Ok(action),
                     }
@@ -2450,6 +2549,7 @@ pub fn run_with_loader(
     show_thinking: bool,
     show_deleted_projects: bool,
     providers: &[Box<dyn Provider>],
+    default_args: &[String],
 ) -> Result<(Action, Vec<Conversation>)> {
     // Set up panic hook to restore terminal
     let original_hook = std::panic::take_hook();
@@ -2571,6 +2671,16 @@ pub fn run_with_loader(
                                 path.display(),
                             ));
                         }
+                    }
+                    Action::Resume(ref path) => {
+                        let path = path.clone();
+                        handle_resume_action(
+                            &mut app,
+                            &mut guard.terminal,
+                            &path,
+                            providers,
+                            default_args,
+                        );
                     }
                     _ => return Ok((action, app.into_conversations())),
                 }

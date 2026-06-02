@@ -917,27 +917,28 @@ fn normalize_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-#[cfg(unix)]
-fn run_cursor_agent_command(command: &mut Command) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    let err = command.exec();
-    Err(AppError::ClaudeExecutionError(err.to_string()))
-}
-
-#[cfg(not(unix))]
 fn run_cursor_agent_command(command: &mut Command) -> Result<()> {
     let status = command
         .status()
         .map_err(|err| AppError::ClaudeExecutionError(err.to_string()))?;
 
-    if !status.success() {
-        return Err(AppError::ClaudeExecutionError(format!(
+    if treat_status_as_success(&status) {
+        Ok(())
+    } else {
+        Err(AppError::ClaudeExecutionError(format!(
             "Cursor Agent CLI exited with status {}",
             status
-        )));
+        )))
     }
+}
 
-    Ok(())
+/// SIGINT-style exits should hand control back to the dashboard without surfacing
+/// an error dialog — the user pressed Ctrl+C on purpose.
+fn treat_status_as_success(status: &std::process::ExitStatus) -> bool {
+    if status.success() {
+        return true;
+    }
+    matches!(status.code(), Some(130))
 }
 
 #[cfg(test)]

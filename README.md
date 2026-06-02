@@ -71,7 +71,7 @@ Press `?` at any time to open the help overlay.
 | `→` | Focus preview pane |
 | `←` / `h` / `Esc` | Return focus to list |
 | `j` / `k` | Scroll preview (when focused) |
-| `Ctrl+R` | Resume conversation in original tool |
+| `Ctrl+R` | Resume conversation in original tool (returns to dashboard on exit) |
 | `Ctrl+X` | Delete conversation |
 | `Ctrl+O` | Select and exit |
 | `Ctrl+W` | Delete word |
@@ -95,7 +95,7 @@ Press `?` at any time to open the help overlay.
 | `I` | Copy session ID to clipboard |
 | `e` | Export to file |
 | `y` | Copy to clipboard |
-| `Ctrl+R` | Resume conversation |
+| `Ctrl+R` | Resume conversation (returns to viewer on exit) |
 | `Ctrl+X` | Delete conversation |
 | `Esc` or `q` | Back to list |
 

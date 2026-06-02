@@ -97,25 +97,48 @@ impl super::Provider for ClaudeProvider {
     }
 }
 
-#[cfg(unix)]
-fn run_claude_command(mut command: Command) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    let err = command.exec();
-    Err(AppError::ClaudeExecutionError(err.to_string()))
-}
-
-#[cfg(not(unix))]
 fn run_claude_command(mut command: Command) -> Result<()> {
     let status = command
         .status()
         .map_err(|e| AppError::ClaudeExecutionError(e.to_string()))?;
 
-    if !status.success() {
-        return Err(AppError::ClaudeExecutionError(format!(
+    if treat_status_as_success(&status) {
+        Ok(())
+    } else {
+        Err(AppError::ClaudeExecutionError(format!(
             "claude CLI exited with status {}",
             status
-        )));
+        )))
+    }
+}
+
+/// Treat clean exits and SIGINT (Ctrl+C) as a successful return so the dashboard
+/// resurfaces silently when the user quits the resumed session.
+fn treat_status_as_success(status: &std::process::ExitStatus) -> bool {
+    if status.success() {
+        return true;
+    }
+    // 130 is the conventional exit code for SIGINT (Ctrl+C); the user quit on purpose.
+    matches!(status.code(), Some(130))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::treat_status_as_success;
+
+    #[cfg(unix)]
+    #[test]
+    fn sigint_is_treated_as_success() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(130 << 8);
+        assert!(treat_status_as_success(&status));
     }
 
-    Ok(())
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_failure_is_not_success() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = std::process::ExitStatus::from_raw(1 << 8);
+        assert!(!treat_status_as_success(&status));
+    }
 }

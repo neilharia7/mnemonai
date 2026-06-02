@@ -183,14 +183,12 @@ fn run() -> Result<()> {
             show_thinking,
             show_deleted_projects,
             &providers,
+            default_args,
         )? {
             (tui::Action::Select(path), convs) => (convs, path),
-            (tui::Action::Resume(path), convs) => {
-                resume_conversation(&convs, &path, &providers, default_args)?;
-                return Ok(());
-            }
             (tui::Action::Quit, _) => return Err(AppError::SelectionCancelled),
             (tui::Action::Delete(_), _) => unreachable!("Delete is handled internally"),
+            (tui::Action::Resume(_), _) => unreachable!("Resume is handled internally"),
         }
     } else {
         // Local mode - load from all providers for current directory
@@ -234,14 +232,12 @@ fn run() -> Result<()> {
             show_thinking,
             show_deleted_projects,
             &providers,
+            default_args,
         )? {
             tui::Action::Select(path) => (conversations, path),
-            tui::Action::Resume(path) => {
-                resume_conversation(&conversations, &path, &providers, default_args)?;
-                return Ok(());
-            }
             tui::Action::Quit => return Err(AppError::SelectionCancelled),
             tui::Action::Delete(_) => unreachable!("Delete is handled internally"),
+            tui::Action::Resume(_) => unreachable!("Resume is handled internally"),
         }
     };
 
